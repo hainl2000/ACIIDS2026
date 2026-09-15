@@ -11,3 +11,4 @@ our_dataset/dataset2/result/gate_results.csv
 logs/
 temp_folders/
 DocumentMaterial/
+*.md
