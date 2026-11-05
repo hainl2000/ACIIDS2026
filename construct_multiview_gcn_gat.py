@@ -2,9 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
-from torch_geometric.utils import dense_to_sparse
 import numpy as np
-import pandas as pd
 
 # Device configuration for CUDA support
 def get_device():
@@ -32,25 +30,41 @@ class GCNBlock(nn.Module):
         self.conv2 = GCNConv(hidden_channels, hidden_channels)
         self.dropout = nn.Dropout(dropout_rate)
 
+    @staticmethod
+    def gcn_norm_dense(adj_matrix):
+        """Dense equivalent of PyG's gcn_norm for a weighted graph given as a dense matrix.
+
+        Same as GCNConv(normalize=True, add_self_loops=True) on dense_to_sparse(adj_matrix):
+        nodes without a self-loop get one with weight 1, deg_j = sum_i a_ij, and a message
+        i -> j is scaled by deg_i^-1/2 * a_ij * deg_j^-1/2. Returns M with GCNConv(x) = M @ (x W) + b.
+        The similarity views are ~90-100% dense, so dense matmul is much faster than message passing.
+        """
+        diag = torch.diagonal(adj_matrix)
+        a = adj_matrix + torch.diag(torch.where(diag == 0, torch.ones_like(diag), torch.zeros_like(diag)))
+        d_inv_sqrt = a.sum(dim=0).pow(-0.5)
+        d_inv_sqrt = torch.where(torch.isinf(d_inv_sqrt), torch.zeros_like(d_inv_sqrt), d_inv_sqrt)
+        return (d_inv_sqrt[:, None] * a * d_inv_sqrt[None, :]).t()
+
+    @staticmethod
+    def _conv(conv, x, norm_adj):
+        # GCNConv = linear transform (no bias) -> weighted aggregation -> + bias, using the conv's own parameters
+        return norm_adj @ conv.lin(x) + conv.bias
+
     def forward(self, x, adj_matrix):
         # Ensure tensors are on the correct device
         x = x.to(DEVICE)
         adj_matrix = adj_matrix.to(DEVICE)
-        
-        # Chuyển ma trận kề dày sang định dạng edge_index của PyG.
-        # edge_weight giữ giá trị similarity của từng cạnh ("weighted multi-view GCN");
-        # nếu bỏ nó, GCNConv coi mọi cạnh có trọng số 1 và view dày đặc thành đồ thị đầy đủ.
-        edge_index, edge_weight = dense_to_sparse(adj_matrix)
-        edge_index = edge_index.to(DEVICE)
-        edge_weight = edge_weight.to(DEVICE)
+
+        # Weighted multi-view GCN: the similarity values are the edge weights.
+        norm_adj = self.gcn_norm_dense(adj_matrix)
 
         # Lớp 1
-        x = self.conv1(x, edge_index, edge_weight)
+        x = self._conv(self.conv1, x, norm_adj)
         x = F.relu(x)
         x = self.dropout(x)
 
         # Lớp 2
-        x = self.conv2(x, edge_index, edge_weight)
+        x = self._conv(self.conv2, x, norm_adj)
         x = F.relu(x)
         x = self.dropout(x)
         return x

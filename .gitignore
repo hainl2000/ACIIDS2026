@@ -14,3 +14,6 @@ DocumentMaterial/
 *.md
 # Material not needed to run preprocessing or joint_end_to_end_main.py
 unrelevant_folders/
+
+# Backup copies of the original LDAGM-based datasets (negatives de-duplicated)
+our_dataset/*_original_dedup/

@@ -1,6 +1,8 @@
+import random
 import time
 import warnings
 
+import numpy as np
 import torch
 import pandas as pd
 from sklearn.metrics import (
@@ -56,6 +58,12 @@ def run_fold(fold, dataset, device):
     print(f"Starting Fold {fold + 1}/5")
     print(f"{'='*50}")
 
+    # Per-fold seeds (model init, batch order); MPS kernels are not bit-for-bit deterministic
+    seed = config.SEED + fold
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
     fold_data = load_fold_data(dataset, fold, device)
 
     print(f"Starting joint end-to-end training for fold {fold + 1}...")
@@ -69,6 +77,7 @@ def run_fold(fold, dataset, device):
         lnc_mi_interaction=fold_data.lnc_mi_tensor,
         mi_di_interaction=fold_data.mi_di_tensor,
         phase1_features=fold_data.phase1_features,
+        val_dataset=fold_data.val_dataset,
         fold=fold,
         device=device
     )
@@ -82,17 +91,17 @@ def run_fold(fold, dataset, device):
         lnc_mi_interaction=fold_data.lnc_mi_tensor,
         mi_di_interaction=fold_data.mi_di_tensor,
         fold=fold,
-        batch_size=config.BATCH_SIZE,
+        batch_size=config.EVAL_BATCH_SIZE,
         device=device
     )
 
     metrics = evaluate_predictions(test_labels, test_predictions)
 
-    print(f"\n=== Fold {fold + 1} Results ===")
+    print(f"\n=== Fold {fold + 1} Results (weights of epoch {trained_model.best_epoch}) ===")
     for name in METRIC_NAMES:
         print(f"{name}: {metrics[name]:.4f}")
 
-    return {"fold": fold + 1, **metrics}
+    return {"fold": fold + 1, **metrics, "best_epoch": trained_model.best_epoch}
 
 
 def format_runtime(total_seconds):
@@ -132,6 +141,8 @@ def summarize_results(all_fold_results, start_time):
         f.write("================================================\n")
 
     avg_metrics = {metric: results_df[metric].mean() for metric in METRIC_NAMES}
+    avg_metrics.update({f"{metric}_std": results_df[metric].std() for metric in METRIC_NAMES})
+    avg_metrics["best_epochs"] = " ".join(str(e) for e in results_df["best_epoch"])
     avg_metrics["Time"] = f"{h} hours, {m} minutes, and {s:.2f} seconds"
     log_to_csv(config, avg_metrics)
 

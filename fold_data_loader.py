@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 
 import copy
 import numpy as np
@@ -16,6 +17,7 @@ class FoldData:
     num_diseases: int
     num_mi: int
     train_dataset: JointDataset
+    val_dataset: Optional[JointDataset]  # held-out training pairs for early stopping (None if VAL_RATIO == 0)
     test_dataset: JointDataset
     multi_view_data: dict
     lnc_di_tensor: torch.Tensor
@@ -89,7 +91,24 @@ def _load_phase1_features(dataset, fold, network_num):
     return torch.tensor(np.stack(features), dtype=torch.float32)  # (network_num, N, feature_dim)
 
 
-def load_fold_data(dataset, fold, device, network_num=config.NETWORK_NUM):
+def _split_validation(train_positive_ij, train_negative_ij, val_ratio, seed):
+    """Hold out val_ratio of the training positives and of the training negatives (keeps the 1:1 ratio).
+
+    Note: the held-out positives stay visible in the input graph (only test positives are masked in
+    preprocessing), so this split is used only to choose the stopping epoch, never to report results.
+    """
+    rng = np.random.default_rng(seed)
+    parts = []
+    for ij in (train_positive_ij, train_negative_ij):
+        perm = rng.permutation(len(ij))
+        n_val = int(round(val_ratio * len(ij)))
+        parts.append((ij[perm[n_val:]], ij[perm[:n_val]]))
+    (pos_fit, pos_val), (neg_fit, neg_val) = parts
+    return pos_fit, neg_fit, pos_val, neg_val
+
+
+def load_fold_data(dataset, fold, device, network_num=config.NETWORK_NUM,
+                   val_ratio=config.VAL_RATIO, seed=config.SEED):
     """Load and assemble all data needed to train/test a single cross-validation fold."""
     (positive_ij, positive5foldsidx, train_positive_ij, train_negative_ij,
      test_positive_ij, test_negative_ij) = _load_fold_split_indices(dataset, fold)
@@ -122,7 +141,12 @@ def load_fold_data(dataset, fold, device, network_num=config.NETWORK_NUM):
         torch.tensor(sim['mi_func'], dtype=torch.float32).to(device)
     ]
 
-    # Create datasets
+    # Create datasets (optionally hold out a validation split from the training pairs for early stopping)
+    val_dataset = None
+    if val_ratio > 0:
+        train_positive_ij, train_negative_ij, val_positive_ij, val_negative_ij = _split_validation(
+            train_positive_ij, train_negative_ij, val_ratio, seed + fold)
+        val_dataset = JointDataset(val_positive_ij, val_negative_ij, "val", dataset)
     train_dataset = JointDataset(train_positive_ij, train_negative_ij, "train", dataset)
     test_dataset = JointDataset(test_positive_ij, test_negative_ij, "test", dataset)
 
@@ -150,6 +174,7 @@ def load_fold_data(dataset, fold, device, network_num=config.NETWORK_NUM):
         num_diseases=num_diseases,
         num_mi=num_mi,
         train_dataset=train_dataset,
+        val_dataset=val_dataset,
         test_dataset=test_dataset,
         multi_view_data=multi_view_data,
         lnc_di_tensor=lnc_di_tensor,
