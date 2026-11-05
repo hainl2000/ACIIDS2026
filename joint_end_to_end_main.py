@@ -68,6 +68,7 @@ def run_fold(fold, dataset, device):
         lnc_di_interaction=fold_data.lnc_di_tensor,
         lnc_mi_interaction=fold_data.lnc_mi_tensor,
         mi_di_interaction=fold_data.mi_di_tensor,
+        phase1_features=fold_data.phase1_features,
         fold=fold,
         device=device
     )

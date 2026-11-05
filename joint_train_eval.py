@@ -6,7 +6,7 @@ from joint_model import JointVGAE_LDAGM, joint_loss_function
 
 
 def joint_train(num_lnc, num_diseases, num_mi, train_dataset, multi_view_data,
-               lnc_di_interaction, lnc_mi_interaction, mi_di_interaction,
+               lnc_di_interaction, lnc_mi_interaction, mi_di_interaction, phase1_features,
                fold=0, batch_size=config.BATCH_SIZE, epochs=config.EPOCHS, lr=config.LEARNING_RATE,
                weight_decay=config.WEIGHT_DECAY, device=config.DEVICE,
                vgae_weight=config.VGAE_WEIGHT, link_weight=config.LINK_WEIGHT, kl_weight=config.KL_WEIGHT,
@@ -25,6 +25,7 @@ def joint_train(num_lnc, num_diseases, num_mi, train_dataset, multi_view_data,
         lnc_di_interaction: lncRNA-disease interaction matrix
         lnc_mi_interaction: lncRNA-miRNA interaction matrix
         mi_di_interaction: miRNA-disease interaction matrix
+        phase1_features: (K, N, F) offline GCN-AE embeddings for this fold (A_encoder/), fixed
         batch_size: Batch size for training
         epochs: Number of training epochs
         lr: Learning rate
@@ -42,16 +43,9 @@ def joint_train(num_lnc, num_diseases, num_mi, train_dataset, multi_view_data,
         Trained model and loss history
     """
 
-    # Convert interactions to numpy for concatenation
-    lnc_di_np = lnc_di_interaction.detach().cpu().numpy()
-    lnc_mi_np = lnc_mi_interaction.detach().cpu().numpy()
-    mi_di_np = mi_di_interaction.detach().cpu().numpy()
-
     # Model parameters
     num_nodes = num_lnc + num_diseases + num_mi
     in_dimension = num_lnc + num_diseases + num_mi
-    total_links = (lnc_di_np.sum() + lnc_mi_np.sum() + mi_di_np.sum())*2 + num_lnc + num_diseases + num_mi
-    pos_weight = torch.tensor(float(num_nodes**2 - total_links) / total_links, device=device)
 
     # Initialize joint model
     model = JointVGAE_LDAGM(
@@ -63,6 +57,7 @@ def joint_train(num_lnc, num_diseases, num_mi, train_dataset, multi_view_data,
         vgae_embed_dim=vgae_embed_dim,
         ldagm_hidden_dim=ldagm_hidden_dim,
         ldagm_layers=ldagm_layers,
+        phase1_features=phase1_features,
         drop_rate=config.DROP_RATE,
         use_aggregate=config.USE_AGGREGATE,
         gcn_hidden_dim=config.GCN_HIDDEN_DIM,
@@ -90,23 +85,23 @@ def joint_train(num_lnc, num_diseases, num_mi, train_dataset, multi_view_data,
             optimizer.zero_grad()
 
             # Forward pass with end-to-end GCN-Attention + VGAE + LDAGM
-            reconstructed_adj, mu, log_var, avg_network_loss, link_predictions = model(
-                multi_view_data, lnc_di_interaction, lnc_mi_interaction, mi_di_interaction, batch_node_pairs,
-                network_num=config.NETWORK_NUM, fold=fold, dataset=config.DATASET
+            reconstructed_adj, mu, log_var, link_predictions, adj_final = model(
+                multi_view_data, lnc_di_interaction, lnc_mi_interaction, mi_di_interaction, batch_node_pairs
             )
 
-            # Get the original adjacency matrix from the model's forward pass
-            # We need to call the model again without node_pairs to get the original adj matrix
-            with torch.no_grad():
-                original_adj_reconstructed, _, _ = model(
-                    multi_view_data, lnc_di_interaction, lnc_mi_interaction, mi_di_interaction, None,
-                    network_num=config.NETWORK_NUM, fold=fold, dataset=config.DATASET
-                )
+            # VGAE reconstruction target = A_final, the same matrix the VGAE encoded (Eq. 22).
+            # Detached so the reconstruction loss cannot "move the target" toward the decoder output;
+            # the feature extractors still get gradient through the VGAE input path.
+            recon_target = adj_final.detach()
+            # Standard VGAE positive weight w = (N^2 - sum A) / sum A, computed on the actual target
+            # (A_final has dense similarity blocks, so it is not a sparse binary graph).
+            target_mass = recon_target.sum()
+            pos_weight = (num_nodes ** 2 - target_mass) / target_mass
 
-            # Compute joint loss using the dynamically generated adjacency matrix
+            # Compute joint loss (Eq. 32)
             total_loss, loss_components = joint_loss_function(
-                reconstructed_adj, original_adj_reconstructed.detach(), mu, log_var,
-                avg_network_loss, link_predictions, batch_labels, num_nodes, pos_weight,
+                reconstructed_adj, recon_target, mu, log_var,
+                link_predictions, batch_labels, num_nodes, pos_weight,
                 vgae_weight, link_weight, kl_weight
             )
 
@@ -124,7 +119,7 @@ def joint_train(num_lnc, num_diseases, num_mi, train_dataset, multi_view_data,
         loss_history.append(avg_losses)
 
         with open(config.LOG_FILE, 'a') as f:
-            f.write(f"Epoch {epoch+1}/{epochs}: Total Loss: {avg_losses['total']:.4f}, Link Prediction: {avg_losses['link_prediction']:.4f}, VGAE Reconstruction: {avg_losses['vgae_reconstruction']:.4f}, KL Divergence: {avg_losses['kl_divergence']:.4f}, Average Network Loss: {avg_losses['avg_network_loss']:.4f}\n")
+            f.write(f"Epoch {epoch+1}/{epochs}: Total Loss: {avg_losses['total']:.4f}, Link Prediction: {avg_losses['link_prediction']:.4f}, VGAE Reconstruction: {avg_losses['vgae_reconstruction']:.4f}, KL Divergence: {avg_losses['kl_divergence']:.4f}\n")
             f.write("-----------------------")
 
         if (epoch + 1) % 10 == 0:
@@ -133,7 +128,6 @@ def joint_train(num_lnc, num_diseases, num_mi, train_dataset, multi_view_data,
             print(f"  Link Prediction: {avg_losses['link_prediction']:.4f}")
             print(f"  VGAE Reconstruction: {avg_losses['vgae_reconstruction']:.4f}")
             print(f"  KL Divergence: {avg_losses['kl_divergence']:.4f}")
-            print(f"  Average Network Loss: {avg_losses['avg_network_loss']:.4f}")
 
     return model, loss_history
 
@@ -171,8 +165,9 @@ def joint_test(model, test_dataset, multi_view_data, lnc_di_interaction, lnc_mi_
             batch_node_pairs = batch_node_pairs.to(device)
 
             # Forward pass with end-to-end GCN-Attention integration
-            _, _, _, _, link_predictions = model(multi_view_data, lnc_di_interaction, lnc_mi_interaction, mi_di_interaction, batch_node_pairs,
-                                            network_num=config.NETWORK_NUM, fold=fold, dataset=config.DATASET)
+            # (Phase-1 features of this fold are stored inside the model as a buffer)
+            _, _, _, link_predictions, _ = model(multi_view_data, lnc_di_interaction, lnc_mi_interaction,
+                                                 mi_di_interaction, batch_node_pairs)
 
             # Apply sigmoid to get probabilities
             predictions = torch.sigmoid(link_predictions)

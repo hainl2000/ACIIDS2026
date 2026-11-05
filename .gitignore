@@ -12,3 +12,5 @@ logs/
 temp_folders/
 DocumentMaterial/
 *.md
+# Material not needed to run preprocessing or joint_end_to_end_main.py
+unrelevant_folders/

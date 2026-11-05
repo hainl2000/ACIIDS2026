@@ -15,12 +15,14 @@ class LplsNorm(nn.Module):
 
 # convolutional
 class Convolution(nn.Module):
-    def __init__(self, in_dimension, out_dimension):
+    def __init__(self, in_dimension, out_dimension, activation=True):
         super(Convolution, self).__init__()
-        self.LinearLayer = nn.Sequential(
-            nn.Linear(in_dimension, out_dimension),
-            nn.ReLU()
-        )
+        # activation=False cho hai đầu ra mean / log_var của VGAE: chúng phải nhận giá trị
+        # trên toàn R (ReLU ép mu >= 0 và log_var >= 0, tức sigma >= 1).
+        layers = [nn.Linear(in_dimension, out_dimension)]
+        if activation:
+            layers.append(nn.ReLU())
+        self.LinearLayer = nn.Sequential(*layers)
 
     def forward(self, adjacency_matrix, feature):
         mf = feature + torch.mm(adjacency_matrix, feature)
@@ -35,9 +37,9 @@ class VGAE_Encoder(nn.Module):
         # Lớp GCN cơ sở
         self.base_gcn = Convolution(in_dimension, hidden_dimension)
         
-        # Hai lớp tuyến tính để tạo ra mean và log_var
-        self.gcn_mean = Convolution(hidden_dimension, embedding_dimension)
-        self.gcn_log_var = Convolution(hidden_dimension, embedding_dimension)
+        # Hai lớp tuyến tính để tạo ra mean và log_var (không ReLU: mu, log_var thuộc R)
+        self.gcn_mean = Convolution(hidden_dimension, embedding_dimension, activation=False)
+        self.gcn_log_var = Convolution(hidden_dimension, embedding_dimension, activation=False)
 
     def forward(self, adj_matrix, features):
         # 1. Chuẩn hóa ma trận kề
@@ -58,10 +60,10 @@ class InnerProductDecoder(nn.Module):
         super(InnerProductDecoder, self).__init__()
 
     def forward(self, z):
-        # Tái tạo ma trận kề bằng cách lấy z nhân với chuyển vị của nó
-        z_t = z.t()
-        adj_reconstructed = torch.mm(z, z_t)
-        return torch.sigmoid(adj_reconstructed)
+        # Tái tạo ma trận kề bằng cách lấy z nhân với chuyển vị của nó.
+        # Trả về LOGITS z z^T (chưa qua sigmoid): sigmoid của Eq. 21 được áp bên trong
+        # F.binary_cross_entropy_with_logits khi tính loss. Cần xác suất thì gọi torch.sigmoid bên ngoài.
+        return torch.mm(z, z.t())
 
 class VGAE_Model(nn.Module):
     def __init__(self, in_dimension, hidden_dimension, embedding_dimension):

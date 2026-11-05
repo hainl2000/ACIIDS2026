@@ -37,17 +37,20 @@ class GCNBlock(nn.Module):
         x = x.to(DEVICE)
         adj_matrix = adj_matrix.to(DEVICE)
         
-        # Chuyển ma trận kề dày sang định dạng edge_index của PyG
-        edge_index, _ = dense_to_sparse(adj_matrix)
+        # Chuyển ma trận kề dày sang định dạng edge_index của PyG.
+        # edge_weight giữ giá trị similarity của từng cạnh ("weighted multi-view GCN");
+        # nếu bỏ nó, GCNConv coi mọi cạnh có trọng số 1 và view dày đặc thành đồ thị đầy đủ.
+        edge_index, edge_weight = dense_to_sparse(adj_matrix)
         edge_index = edge_index.to(DEVICE)
-        
+        edge_weight = edge_weight.to(DEVICE)
+
         # Lớp 1
-        x = self.conv1(x, edge_index)
+        x = self.conv1(x, edge_index, edge_weight)
         x = F.relu(x)
         x = self.dropout(x)
-        
+
         # Lớp 2
-        x = self.conv2(x, edge_index)
+        x = self.conv2(x, edge_index, edge_weight)
         x = F.relu(x)
         x = self.dropout(x)
         return x
@@ -275,15 +278,26 @@ def reconstruct_similarity_matrix(embeddings):
     return similarity_matrix    
 
 
-def concatenate(lnclen, dilen, milen, lnc_di, lnc_mi, mi_di, lncSiNet, diSiNet, miSiNet):
-    A = np.zeros((lnclen + dilen + milen, lnclen + dilen + milen))
-    A[: lnclen, lnclen: lnclen + dilen] = lnc_di
-    A[lnclen: lnclen + dilen, : lnclen] = lnc_di.T
-    A[: lnclen, lnclen + dilen: ] = lnc_mi
-    A[lnclen + dilen: , : lnclen] = lnc_mi.T
-    A[lnclen: lnclen + dilen, lnclen + dilen: ] = mi_di.T
-    A[lnclen + dilen: , lnclen: lnclen + dilen] = mi_di
-    A[: lnclen, : lnclen] = lncSiNet
-    A[lnclen: lnclen + dilen, lnclen: lnclen + dilen] = diSiNet
-    A[lnclen + dilen: , lnclen + dilen: ] = miSiNet
-    return A
+def concatenate(lnc_di, lnc_mi, mi_di, lncSiNet, diSiNet, miSiNet):
+    """Assemble the heterogeneous adjacency matrix A_final (Eq. 20) from its blocks.
+
+    Built with torch.cat (not NumPy) so the result stays in the autograd graph: gradients
+    flow back into the enriched similarity blocks and from there into the multi-view
+    GCN + attention feature extractors.
+
+    Block layout (L = lncRNA, D = disease, M = miRNA):
+        [ lncSiNet    lnc_di     lnc_mi  ]
+        [ lnc_di.T    diSiNet    mi_di.T ]
+        [ lnc_mi.T    mi_di      miSiNet ]
+
+    Args (all torch tensors on the same device):
+        lnc_di: (L, D), lnc_mi: (L, M), mi_di: (M, D)
+        lncSiNet: (L, L), diSiNet: (D, D), miSiNet: (M, M)
+
+    Returns:
+        torch.Tensor of shape (L + D + M, L + D + M)
+    """
+    top = torch.cat([lncSiNet, lnc_di, lnc_mi], dim=1)
+    mid = torch.cat([lnc_di.T, diSiNet, mi_di.T], dim=1)
+    bot = torch.cat([lnc_mi.T, mi_di, miSiNet], dim=1)
+    return torch.cat([top, mid, bot], dim=0)

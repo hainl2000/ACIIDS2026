@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from construct_multiview_gcn_gat import concatenate, MultiViewFeatureExtractor, reconstruct_similarity_matrix
 from vgae_model import VGAE_Model
@@ -15,8 +14,13 @@ class JointVGAE_LDAGM(nn.Module):
     and LDAGM for link prediction in an end-to-end manner.
     """
     def __init__(self, num_lnc, num_diseases, num_mi, vgae_in_dim, vgae_hidden_dim, vgae_embed_dim,
-                 ldagm_hidden_dim, ldagm_layers, drop_rate=config.DROP_RATE, use_aggregate=config.USE_AGGREGATE,
+                 ldagm_hidden_dim, ldagm_layers, phase1_features, drop_rate=config.DROP_RATE,
+                 use_aggregate=config.USE_AGGREGATE,
                  gcn_hidden_dim=config.GCN_HIDDEN_DIM, fusion_output_dim=config.FUSION_OUTPUT_DIM):
+        """
+        phase1_features: tensor (K, N, F) of Phase-1 nonlinear features computed OFFLINE by the GCN-AE
+            (A_encoder/A_{fold}_{k}.npy, paper Eq. 11-14). Stored as a fixed buffer: no gradient, no loss.
+        """
         super(JointVGAE_LDAGM, self).__init__()
 
         # Store dimensions for multi-view processing
@@ -53,14 +57,15 @@ class JointVGAE_LDAGM(nn.Module):
         # VGAE component for graph representation learning
         self.vgae = VGAE_Model(vgae_in_dim, vgae_hidden_dim, vgae_embed_dim)
 
+        # Phase-1 offline features (fixed, moves with model.to(device), never trained)
+        self.register_buffer("phase1_features", phase1_features.detach().float())
+        network_num, _, phase1_dim = self.phase1_features.shape
+
         # LDAGM component for link prediction
-        # Input dimension: flattened features from pair_features tensor
-        # pair_features shape: [batch_size, 2, features_per_node]
-        # After flattening: [batch_size, 2 * features_per_node]
-        # Actual feature dimension is 1024 based on runtime, so 512 per node # Based on A_encoder file shape
-        network_num = config.NETWORK_NUM
-        features_per_node = network_num * 2 * vgae_embed_dim
-        ldagm_input_dim = 2 * features_per_node  # Fixed based on actual runtime dimensions
+        # Per node: [mu_i || R_e^(1)(i) || ... || R_e^(K)(i)]  -> vgae_embed_dim + K * phase1_dim
+        # Per pair: [node1 features || node2 features]       -> 2 * features_per_node
+        features_per_node = vgae_embed_dim + network_num * phase1_dim
+        ldagm_input_dim = 2 * features_per_node
         self.ldagm = LDAGM(
             input_dimension=ldagm_input_dim,
             hidden_dimension=ldagm_hidden_dim,
@@ -88,43 +93,31 @@ class JointVGAE_LDAGM(nn.Module):
 
     def _build_adjacency_matrix(self, disease_similarity, lnc_similarity, mi_similarity,
                                  lnc_di_interaction, lnc_mi_interaction, mi_di_interaction):
-        """Concatenate interaction matrices and reconstructed similarities into one adjacency matrix."""
-        adj_matrix_np = concatenate(
-            self.num_lnc, self.num_diseases, self.num_mi,
-            lnc_di_interaction.detach().cpu().numpy(),
-            lnc_mi_interaction.detach().cpu().numpy(),
-            mi_di_interaction.detach().cpu().numpy(),
-            lnc_similarity.detach().cpu().numpy(),
-            disease_similarity.detach().cpu().numpy(),
-            mi_similarity.detach().cpu().numpy()
+        """Assemble A_final (Eq. 20) from interaction matrices and enriched similarities.
+
+        Stays in torch (no NumPy round-trip), so gradients reach the multi-view feature extractors.
+        """
+        return concatenate(
+            lnc_di_interaction, lnc_mi_interaction, mi_di_interaction,
+            lnc_similarity, disease_similarity, mi_similarity
         )
-        return torch.tensor(adj_matrix_np, dtype=torch.float32, device=config.DEVICE)
 
-    def _predict_links(self, mu, node_pairs, network_num, fold, dataset):
-        """Build per-network pair features from VGAE embeddings and run LDAGM link prediction."""
-        list_mu, avg_network_loss = encoder_matrix_by_vgae(dataset, self.vgae, network_num, fold)
-        node1_computational_embeddings = mu[node_pairs[:, 0]]
-        node2_computational_embeddings = mu[node_pairs[:, 1]]
+    def _node_features(self, mu, node_idx):
+        """[mu_i || R_e^(1)(i) || ... || R_e^(K)(i)] for each node index (paper: VGAE mu + Phase-1 features)."""
+        phase1 = self.phase1_features[:, node_idx, :]                   # (K, B, F)
+        phase1 = phase1.permute(1, 0, 2).reshape(node_idx.size(0), -1)  # (B, K * F), networks in order 1..K
+        return torch.cat([mu[node_idx], phase1], dim=1)
 
-        node1_all_features = []
-        node2_all_features = []
+    def _pair_features(self, mu, node_pairs):
+        """Concatenate the features of both nodes of each pair: (B, 2 * features_per_node)."""
+        return torch.cat([self._node_features(mu, node_pairs[:, 0]),
+                          self._node_features(mu, node_pairs[:, 1])], dim=1)
 
-        for i in range(network_num):
-            node1_features_net_i = torch.cat([node1_computational_embeddings, list_mu[i][node_pairs[:, 0]]], dim=1)
-            node2_features_net_i = torch.cat([node2_computational_embeddings, list_mu[i][node_pairs[:, 1]]], dim=1)
+    def _predict_links(self, mu, node_pairs):
+        """Run LDAGM on the pair features; returns logits."""
+        return self.ldagm(self._pair_features(mu, node_pairs))
 
-            node1_all_features.append(node1_features_net_i)
-            node2_all_features.append(node2_features_net_i)
-
-        node1_final_features = torch.cat(node1_all_features, dim=1)
-        node2_final_features = torch.cat(node2_all_features, dim=1)
-
-        pair_features = torch.stack([node1_final_features, node2_final_features], dim=1)
-        pair_features_flattened = pair_features.view(pair_features.size(0), -1)
-        link_predictions = self.ldagm(pair_features_flattened)
-        return avg_network_loss, link_predictions
-
-    def forward(self, multi_view_data, lnc_di_interaction, lnc_mi_interaction, mi_di_interaction, node_pairs=None, network_num=4, fold=0, dataset="dataset1"):
+    def forward(self, multi_view_data, lnc_di_interaction, lnc_mi_interaction, mi_di_interaction, node_pairs=None):
         """
         Forward pass for joint end-to-end training.
 
@@ -137,13 +130,11 @@ class JointVGAE_LDAGM(nn.Module):
             lnc_mi_interaction: lncRNA-miRNA interaction matrix
             mi_di_interaction: miRNA-disease interaction matrix
             node_pairs: Node pairs for link prediction (optional)
-            network_num: Number of networks for A_encoder loading
-            fold: Fold number for A_encoder file paths
-            dataset: Dataset name for A_encoder file paths
 
         Returns:
-            If node_pairs is None: (reconstructed_adj, mu, log_var)
-            If node_pairs is provided: (reconstructed_adj, mu, log_var, avg_network_loss, link_predictions)
+            If node_pairs is None: (reconstructed_adj, mu, log_var, adj_matrix)
+            If node_pairs is provided: (reconstructed_adj, mu, log_var, link_predictions, adj_matrix)
+            adj_matrix is A_final (Eq. 20), the VGAE input and its reconstruction target (Eq. 22).
         """
         # Step 1: Extract multi-view features using GCN-Attention
         disease_fused_features, lnc_fused_features, mi_fused_features = self._extract_multiview_features(multi_view_data)
@@ -167,67 +158,25 @@ class JointVGAE_LDAGM(nn.Module):
         reconstructed_adj, mu, log_var = self.vgae(adj_matrix, features_input)
 
         if node_pairs is None:
-            return reconstructed_adj, mu, log_var
+            return reconstructed_adj, mu, log_var, adj_matrix
 
-        # Step 6-7: Extract per-network features and run LDAGM link prediction
-        avg_network_loss, link_predictions = self._predict_links(mu, node_pairs, network_num, fold, dataset)
-        return reconstructed_adj, mu, log_var, avg_network_loss, link_predictions
-
-
-def encoder_matrix_by_vgae(dataset, vgae_model, network_num, fold):
-    """
-    Extract encoder matrices (mu) from VGAE for each network.
-
-    Args:
-        dataset: Dataset name
-        vgae_model: VGAE model instance
-        network_num: Number of networks
-        fold: Current fold number
-
-    Returns:
-        List of mu tensors from each network, and the average per-network encoder loss
-    """
-    list_mu = []
-    total_encoder_loss = 0.0
-    for i in range(network_num):
-        A = torch.Tensor(np.load('./our_dataset/' + dataset + '/A/A_' + str(fold + 1) + '_' + str(i + 1) + '.npy'))
-        adj_matrix = torch.tensor(A, dtype=torch.float32, device=config.DEVICE)
-        num_nodes = adj_matrix.shape[0]
-        features_input = torch.eye(num_nodes, device=config.DEVICE)
-        reconstructed_adj, mu, log_var = vgae_model(adj_matrix, features_input)
-        # Compute reconstruction loss for this network
-        total_links = adj_matrix.sum().item()
-        pos_weight = torch.tensor(float(num_nodes**2 - total_links) / max(total_links, 1), device=config.DEVICE)
-
-        reconstruction_loss = F.binary_cross_entropy_with_logits(
-            reconstructed_adj.view(-1),
-            adj_matrix.view(-1),
-            pos_weight=pos_weight
-        )
-
-        # KL divergence loss
-        kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp()) / num_nodes
-
-        # Combine losses for this network
-        network_loss = reconstruction_loss + config.KL_WEIGHT * kl_loss
-        total_encoder_loss += network_loss
-        avg_loss = total_encoder_loss / network_num
-        list_mu.append(mu)
-    return list_mu, avg_loss
+        # Step 6: Pair features [mu || Phase-1 R_e] -> LDAGM link prediction (logits)
+        link_predictions = self._predict_links(mu, node_pairs)
+        return reconstructed_adj, mu, log_var, link_predictions, adj_matrix
 
 
-def joint_loss_function(reconstructed_adj, original_adj, mu, log_var, avg_network_loss,
+def joint_loss_function(reconstructed_adj, original_adj, mu, log_var,
                        link_predictions, link_labels, num_nodes, pos_weight,
                        vgae_weight=1.0, link_weight=1.0, kl_weight=0.1):
     """
-    Unified loss function for joint end-to-end training.
+    Unified loss function for joint end-to-end training (paper Eq. 32):
+        L_total = lambda_recon * L_recon + lambda_kl * L_KL + lambda_link * L_link
 
     Args:
-        reconstructed_adj: Reconstructed adjacency matrix from VGAE
-        original_adj: Original adjacency matrix
+        reconstructed_adj: Reconstruction LOGITS z z^T from the VGAE decoder (sigmoid applied inside the BCE-with-logits loss)
+        original_adj: Reconstruction target A_final (detached)
         mu: Mean of latent distribution
         log_var: Log variance of latent distribution
-        avg_network_loss: Average additional encoder loss from A_encoder matrices
         link_predictions: Link prediction scores from LDAGM
         link_labels: Ground truth link labels
         num_nodes: Number of nodes in the graph
@@ -258,7 +207,6 @@ def joint_loss_function(reconstructed_adj, original_adj, mu, log_var, avg_networ
     total_loss = (
         vgae_weight * vgae_reconstruction_loss +
         kl_weight * kl_loss +
-        avg_network_loss +
         link_weight * link_prediction_loss
     )
 
@@ -266,7 +214,6 @@ def joint_loss_function(reconstructed_adj, original_adj, mu, log_var, avg_networ
         'total': total_loss.item(),
         'vgae_reconstruction': vgae_reconstruction_loss.item(),
         'kl_divergence': kl_loss.item(),
-        'avg_network_loss': avg_network_loss.item(),
         'link_prediction': link_prediction_loss.item(),
     }
     return total_loss, loss_components

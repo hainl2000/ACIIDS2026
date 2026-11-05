@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import torch
 
+import config
 from joint_dataset import JointDataset
 
 
@@ -20,6 +21,7 @@ class FoldData:
     lnc_di_tensor: torch.Tensor
     lnc_mi_tensor: torch.Tensor
     mi_di_tensor: torch.Tensor
+    phase1_features: torch.Tensor  # (NETWORK_NUM, N, A_ENCODER_DIM) offline GCN-AE embeddings R_e of A_1..A_K
 
 
 def _load_fold_split_indices(dataset, fold):
@@ -73,7 +75,21 @@ def _load_interaction_matrices(dataset):
     return lnc_di, lnc_mi, mi_di
 
 
-def load_fold_data(dataset, fold, device):
+def _load_phase1_features(dataset, fold, network_num):
+    """Load the Phase-1 nonlinear features (paper Eq. 11-14) computed OFFLINE by the GCN-AE.
+
+    obtain_nonlinear_features.ipynb trains one GCN-AE per network A_k of this fold (test positives
+    already masked in A/A_{fold+1}_{k}.npy) and saves its embedding R_e to A_encoder/A_{fold+1}_{k}.npy.
+    These are fixed inputs: they get no gradient and add no loss term to the joint training.
+    """
+    features = [
+        np.load(f"./our_dataset/{dataset}/A_encoder/A_{fold + 1}_{k + 1}.npy")
+        for k in range(network_num)
+    ]
+    return torch.tensor(np.stack(features), dtype=torch.float32)  # (network_num, N, feature_dim)
+
+
+def load_fold_data(dataset, fold, device, network_num=config.NETWORK_NUM):
     """Load and assemble all data needed to train/test a single cross-validation fold."""
     (positive_ij, positive5foldsidx, train_positive_ij, train_negative_ij,
      test_positive_ij, test_negative_ij) = _load_fold_split_indices(dataset, fold)
@@ -122,6 +138,13 @@ def load_fold_data(dataset, fold, device):
     lnc_mi_tensor = torch.tensor(lnc_mi, dtype=torch.float32).to(device)
     mi_di_tensor = torch.tensor(mi_di, dtype=torch.float32).to(device)
 
+    # Phase-1 offline GCN-AE embeddings for this fold
+    phase1_features = _load_phase1_features(dataset, fold, network_num)
+    expected = (network_num, num_lnc + num_diseases + num_mi, config.A_ENCODER_DIM)
+    if tuple(phase1_features.shape) != expected:
+        raise ValueError(f"A_encoder features have shape {tuple(phase1_features.shape)}, expected {expected}")
+    phase1_features = phase1_features.to(device)
+
     return FoldData(
         num_lnc=num_lnc,
         num_diseases=num_diseases,
@@ -132,4 +155,5 @@ def load_fold_data(dataset, fold, device):
         lnc_di_tensor=lnc_di_tensor,
         lnc_mi_tensor=lnc_mi_tensor,
         mi_di_tensor=mi_di_tensor,
+        phase1_features=phase1_features,
     )

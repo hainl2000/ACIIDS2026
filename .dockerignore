@@ -30,3 +30,5 @@ dist/
 # Ignore datasets that are mounted as volumes
 our_dataset/
 our_csv_dataset/
+
+unrelevant_folders/
