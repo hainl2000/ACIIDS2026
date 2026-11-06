@@ -17,3 +17,5 @@ unrelevant_folders/
 
 # Backup copies of the original LDAGM-based datasets (negatives de-duplicated)
 our_dataset/*_original_dedup/
+*.zip
+.DS_Store

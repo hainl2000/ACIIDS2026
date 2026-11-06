@@ -47,6 +47,22 @@ GRAD_CLIP = 1.0
 EVAL_EVERY = 1
 LR_PATIENCE = 5
 
+# Two-stage pipeline (fixed embeddings): PPR stage graphs -> offline GCN-AE + VGAE-MLP -> concat8 -> LDAGM
+# Stage k of every entity type uses personalized PageRank with restart probability alpha_k (closed form).
+# The alpha set of each dataset was chosen on validation AUC; the tag names the feature folder offline/<tag>/.
+PPR_ALPHAS = {
+    "dataset2": ("a50-30-15-05", (0.5, 0.3, 0.15, 0.05)),   # mostly global
+    "dataset1": ("a95-80-60-40", (0.95, 0.8, 0.6, 0.4)),    # mostly local
+}
+OFFLINE_EMBED_DIM = 128          # size of every GCN-AE R_e^(k) and VGAE mu^(k)
+OFFLINE_AE_LR = 1e-3             # GCN-AE settings of obtain_nonlinear_features.ipynb
+OFFLINE_AE_WEIGHT_DECAY = 1e-5
+OFFLINE_AE_EPOCHS = 100
+OFFLINE_VGAE_HIDDEN_DIM = 256    # VGAE-MLP encoder: rows of A_k -> 256 -> (mu, log_var) of size 128
+OFFLINE_VGAE_LR = 1e-3
+OFFLINE_VGAE_EPOCHS = 200
+OFFLINE_VGAE_KL_WEIGHT = KL_WEIGHT / VGAE_WEIGHT   # same recon : KL ratio as the joint model (0.3 / 0.9)
+
 # Logging
 LOG_FILE = "logs/joint_training_log.txt"
 CSV_LOG_FILE = "logs/hhm_experiment_results.csv"
