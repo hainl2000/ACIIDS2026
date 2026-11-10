@@ -65,4 +65,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Default command to run the project
-CMD ["python", "main.py"]
+CMD ["python", "final_model.py", "all"]

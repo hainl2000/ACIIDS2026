@@ -1,7 +1,8 @@
 numpy
 pandas
+scipy
 torch
 scikit-learn
-matplotlib
 networkx
 obonet
+matplotlib
